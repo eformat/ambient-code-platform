@@ -427,15 +427,21 @@ jobs:
           # Get PR head SHA
           HEAD_SHA=$(gh pr view ${{ steps.context.outputs.number }} --repo "${{ github.repository }}" --json headRefOid --jq '.headRefOid')
 
-          # Map session phase to check status/conclusion
+          # Look for an existing in_progress "Amber Session" check run to update
+          EXISTING_CHECK_ID=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --jq '.check_runs[] | select(.name == "Amber Session" and .status == "in_progress") | .id' \
+            2>/dev/null | head -1 || echo "")
+
+          # Build check run arguments
           CHECK_ARGS=(
-            -X POST
             -f "name=Amber Session"
-            -f "head_sha=$HEAD_SHA"
-            -f "details_url=$SESSION_URL"
             -f "output[title]=Amber — ${{ steps.context.outputs.prompt_type }} prompt"
             -f "output[summary]=Session \`$SESSION_NAME\` (phase: $SESSION_PHASE)"
           )
+
+          if [ -n "$SESSION_URL" ]; then
+            CHECK_ARGS+=(-f "details_url=$SESSION_URL")
+          fi
 
           case "$SESSION_PHASE" in
             Running)
@@ -448,8 +454,19 @@ jobs:
               CHECK_ARGS+=(-f "status=completed" -f "conclusion=neutral") ;;
           esac
 
-          if ! CHECK_OUTPUT=$(gh api "repos/${{ github.repository }}/check-runs" "${CHECK_ARGS[@]}" 2>&1); then
-            echo "::warning::Failed to create check run: $CHECK_OUTPUT"
+          if [ -n "$EXISTING_CHECK_ID" ]; then
+            # Update the existing check run (PATCH)
+            if ! CHECK_OUTPUT=$(gh api "repos/${{ github.repository }}/check-runs/${EXISTING_CHECK_ID}" \
+              -X PATCH "${CHECK_ARGS[@]}" 2>&1); then
+              echo "::warning::Failed to update check run: $CHECK_OUTPUT"
+            fi
+          else
+            # Create a new check run (POST)
+            CHECK_ARGS+=(-f "head_sha=$HEAD_SHA")
+            if ! CHECK_OUTPUT=$(gh api "repos/${{ github.repository }}/check-runs" \
+              -X POST "${CHECK_ARGS[@]}" 2>&1); then
+              echo "::warning::Failed to create check run: $CHECK_OUTPUT"
+            fi
           fi
 
       - name: Session summary
@@ -548,13 +565,89 @@ jobs:
                   print(f"  Failed to start session: {e}")
                   return False
 
+          def get_head_sha(pr_number):
+              """Get the head SHA of a PR."""
+              return gh("pr", "view", str(pr_number), "--repo", REPO, "--json", "headRefOid", "--jq", ".headRefOid")
+
+          def get_existing_check_run_id(head_sha):
+              """Find an existing in_progress 'Amber Session' check run for the given SHA."""
+              try:
+                  result = gh("api", f"repos/{REPO}/commits/{head_sha}/check-runs",
+                              "--jq", '.check_runs[] | select(.name == "Amber Session" and .status == "in_progress") | .id')
+                  ids = result.strip().split("\n") if result.strip() else []
+                  return ids[0] if ids else None
+              except Exception:
+                  return None
+
+          def update_check_run(check_run_id, status, conclusion=None, title="Amber — batch fix", summary=""):
+              """Update an existing check run by ID."""
+              args = ["api", f"repos/{REPO}/check-runs/{check_run_id}",
+                      "-X", "PATCH",
+                      "-f", f"status={status}",
+                      "-f", f"output[title]={title}",
+                      "-f", f"output[summary]={summary}"]
+              if conclusion:
+                  args.extend(["-f", f"conclusion={conclusion}"])
+              proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if proc.returncode != 0:
+                  print(f"  Warning: failed to update check run {check_run_id}: {proc.stderr or proc.stdout}")
+
+          def resolve_stale_checks(pr_number, session_name=None):
+              """Find all in_progress 'Amber Session' check runs on a PR and complete them."""
+              head_sha = get_head_sha(pr_number)
+              if not head_sha:
+                  return
+              try:
+                  result = gh("api", f"repos/{REPO}/commits/{head_sha}/check-runs",
+                              "--jq", '.check_runs[] | select(.name == "Amber Session" and .status == "in_progress") | .id')
+                  ids = [x.strip() for x in result.strip().split("\n") if x.strip()]
+              except Exception:
+                  ids = []
+              if not ids:
+                  return
+
+              # Check session phase if we have a session name
+              conclusion = "neutral"
+              summary = "Session completed (resolved by batch cycle)"
+              if session_name:
+                  phase = get_session_phase(session_name)
+                  if phase == "Completed":
+                      conclusion = "success"
+                      summary = f"Session `{session_name}` completed successfully"
+                  elif phase in ("Error", "Failed"):
+                      conclusion = "failure"
+                      summary = f"Session `{session_name}` failed (phase: {phase})"
+                  else:
+                      summary = f"Session `{session_name}` resolved (phase: {phase or 'unknown'})"
+
+              for check_id in ids:
+                  print(f"  Resolving stale check run {check_id} on PR #{pr_number}")
+                  update_check_run(check_id, "completed", conclusion=conclusion, summary=summary)
+
           def post_check_run(pr_number, session_name):
-              """Post an in_progress check run on the PR linking to the Amber session."""
-              head_sha = gh("pr", "view", str(pr_number), "--repo", REPO, "--json", "headRefOid", "--jq", ".headRefOid")
+              """Post an in_progress check run on the PR linking to the Amber session.
+              If an existing in_progress check exists, update it instead of creating a duplicate."""
+              head_sha = get_head_sha(pr_number)
               if not head_sha:
                   return
               host = os.environ.get("PLATFORM_HOST", "").rstrip("/")
               session_url = f"{host}/projects/{PROJECT}/sessions/{session_name}" if host else ""
+
+              # Resolve any existing stale checks before posting a new one
+              existing_id = get_existing_check_run_id(head_sha)
+              if existing_id:
+                  args = ["api", f"repos/{REPO}/check-runs/{existing_id}",
+                     "-X", "PATCH",
+                     "-f", "status=in_progress",
+                     "-f", "output[title]=Amber — batch fix",
+                     "-f", f"output[summary]=Session `{session_name}` triggered for PR #{pr_number}"]
+                  if session_url:
+                      args.extend(["-f", f"details_url={session_url}"])
+                  proc = subprocess.run(["gh"] + list(args), capture_output=True, text=True)
+                  if proc.returncode != 0:
+                      print(f"  Warning: failed to update check run for PR #{pr_number}: {proc.stderr or proc.stdout}")
+                  return
+
               args = ["api", f"repos/{REPO}/check-runs",
                  "-X", "POST",
                  "-f", "name=Amber Session",
@@ -672,6 +765,7 @@ jobs:
 
           processed = 0
           skipped = 0
+          pending_sessions = []
 
           for pr in prs:
               number = pr["number"]
@@ -691,6 +785,8 @@ jobs:
                   needs_work, reason = needs_attention(number)
                   if not needs_work:
                       print(f"PR #{number}: {reason}, skipping")
+                      # Resolve any stale in_progress checks on healthy PRs
+                      resolve_stale_checks(number, session_name=session_id)
                       skipped += 1
                       continue
                   print(f"PR #{number}: {reason}")
@@ -750,8 +846,36 @@ jobs:
               result_name = create_session_api(prompt, session_name=session_id)
               if result_name:
                   post_check_run(number, result_name)
+                  pending_sessions.append({"pr": number, "session": result_name})
 
               processed += 1
+
+          # Poll pending sessions for completion and update their check runs
+          if pending_sessions:
+              print(f"\nPolling {len(pending_sessions)} pending session(s) for completion (max 30 min)...")
+              poll_deadline = time.time() + 1800  # 30 minutes
+              while pending_sessions and time.time() < poll_deadline:
+                  time.sleep(30)
+                  still_pending = []
+                  for item in pending_sessions:
+                      phase = get_session_phase(item["session"])
+                      if phase in ("Completed", "Error", "Failed", None):
+                          print(f"  Session {item['session']} for PR #{item['pr']} finished (phase: {phase})")
+                          resolve_stale_checks(item["pr"], session_name=item["session"])
+                      elif phase == "Running":
+                          still_pending.append(item)
+                      else:
+                          # Unknown/stopped phase — resolve as neutral
+                          print(f"  Session {item['session']} for PR #{item['pr']} in unexpected phase: {phase}")
+                          resolve_stale_checks(item["pr"], session_name=item["session"])
+                  pending_sessions = still_pending
+                  if pending_sessions:
+                      print(f"  Still waiting on {len(pending_sessions)} session(s)...")
+
+              # Resolve any remaining sessions that timed out
+              for item in pending_sessions:
+                  print(f"  Session {item['session']} for PR #{item['pr']} timed out, resolving checks")
+                  resolve_stale_checks(item["pr"], session_name=item["session"])
 
           print(f"\nBatch complete: {processed} processed, {skipped} skipped")
           PYEOF
